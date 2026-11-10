@@ -1145,8 +1145,12 @@ async function buildScope({ matrix, nonce }) {
   };
 }
 
-function enabledForProfile(spec, profile) {
-  return !spec.profiles || spec.profiles.includes(profile);
+/**
+ * A step with `whenChanged` belongs to pull-request selection, which knows what
+ * changed. A cleanroom run does not, so it uses the pinned release instead.
+ */
+export function enabledForProfile(spec, profile) {
+  return spec.whenChanged === undefined && (!spec.profiles || spec.profiles.includes(profile));
 }
 
 export function cleanEnvironment({
@@ -1299,7 +1303,9 @@ async function executeCommandSpec(spec, { baseEnv, context, repoRoot }) {
 
 async function executeCorpus(spec, { baseEnv, context, repoRoot, repeats }) {
   const caseRoot = path.join(repoRoot, 'tests/relayflows/cases');
-  const contract = await import(pathToFileURL(path.join(repoRoot, 'scripts/pr-proof/contract.mjs')).href);
+  const contract = await import(
+    pathToFileURL(path.join(repoRoot, 'scripts/verify-features/case-contract.mjs')).href
+  );
   const entries = (await readdir(caseRoot, { withFileTypes: true }))
     .filter((entry) => entry.isDirectory())
     .sort((left, right) => left.name.localeCompare(right.name));

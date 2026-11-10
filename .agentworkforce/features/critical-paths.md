@@ -2,20 +2,32 @@
 
 These are the product sequences to run first after a related change. They use the exact public surface recorded in `manifest.yaml`; detailed fixtures, assertions, and cleanup live in `verify/procedures.md`.
 
-## Path 1: Local Broker Lifecycle
+## Path 1: Relay Init For Your Tools
+
+Run in a disposable home, or use the automated form: `node tests/relayflows/core/init-parity.mjs`.
 
 ```bash
-relay node up --background --no-spawn
-relay node status
-relay node metrics
-relay node deadletters --json
-relay node down
-relay node status
+relay init --tools claude,codex,cursor,grok
+relay status
+relay init --uninstall
+relay init --stop
 ```
 
-The first status must report running and the last must report stopped. Use an isolated project/state directory and never stop all brokers system-wide.
+Each tool must report injection, its own settings file must gain the route, and `--uninstall` must remove it and keep the person's settings.
 
-## Path 2: Cross-Agent Channel Message
+## Path 2: A Message Reaches A Running Session
+
+Use real sessions, or the automated forms: `node tests/relayflows/core/delivery.mjs` and `node tests/relayflows/core/grok-join.mjs`.
+
+```bash
+relay agent list
+relay agent register alice
+relay message dm send <session-name> 'hello' --as alice
+```
+
+The session must join on its own and receive the message as a new turn, without checking an inbox.
+
+## Path 3: Cross-Agent Channel Message
 
 **Prerequisite:** disposable hosted workspace; `TOKEN_A` must be the token returned for
 `critical-a`, and `TOKEN_B` must be the token returned for `critical-b`.
@@ -29,22 +41,6 @@ RELAY_AGENT_TOKEN="$TOKEN_A" relay channel archive critical-path
 ```
 
 Agent B must see the exact text from A. Remove both test identities after archiving the channel.
-
-## Path 3: Managed Local Agent
-
-**Prerequisite:** a locally installed and authenticated provider CLI.
-
-```bash
-PROVIDER="${PROVIDER:-claude}" # installed and authenticated fixture provider
-relay node up --background --no-spawn
-relay node agent spawn "$PROVIDER" --name critical-worker --task 'Reply critical-ok' --spawn-mode task-exit --exit-after-task
-relay node agent list
-relay node agent message hold critical-worker
-relay node agent message auto critical-worker
-relay node agent release critical-worker
-```
-
-Assert that the worker appears, receives its bounded task, and is released. Provider credentials/cost make this a pre-provisioned integration check, not a generic CI test.
 
 ## Path 4: MCP Stdio Round Trip
 
@@ -60,7 +56,7 @@ send_dm → list_dms → check_inbox → mark_message_read → get_message_reade
 close the stdio child
 ```
 
-Assert every static MCP tool in the manifest is listed and that the returned content reflects the values written by the test. The server itself does not require a local broker, but the messaging tools require a workspace and agent identities.
+Assert every static MCP tool in the manifest is listed and that the returned content reflects the values written by the test. The messaging tools require a workspace and agent identities.
 
 ## Path 5: Local Workflow Run, Logs, and Sync
 
@@ -95,10 +91,7 @@ Assert B reads the exact DM and A sees B in readers. Remove the disposable agent
 ```bash
 relay version
 relay status
-relay node status
-relay node up --background --no-spawn
-relay node status
-relay node metrics
+relay agent list
 ```
 
-If any command fails, diagnose that subsystem before testing higher-level paths. Do not treat top-level `relay status` as the broker statistics command; `relay node status` is the direct broker check.
+If any command fails, diagnose that subsystem before testing higher-level paths.
