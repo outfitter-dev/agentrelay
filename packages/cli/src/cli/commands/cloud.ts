@@ -36,6 +36,7 @@ import {
 } from '@agent-relay/cloud';
 
 import { linkEnrolledNodeToProjectPin, type EnrolledNodePinResult } from '../lib/enrollment-pin.js';
+import { describeError } from '../lib/describe-error.js';
 import { defaultExit } from '../lib/exit.js';
 import { sanitizeForTerminalLine } from '../lib/formatting.js';
 import { maskSecret } from '../lib/redact.js';
@@ -126,10 +127,10 @@ function parseNonNegativeInteger(value: string): number {
 }
 
 function parseWorkflowFileType(value: string): WorkflowFileType {
-  if (value === 'yaml' || value === 'ts' || value === 'py') {
+  if (value === 'yaml' || value === 'ts') {
     return value;
   }
-  throw new InvalidArgumentError('Expected workflow type to be one of: yaml, ts, py');
+  throw new InvalidArgumentError('Expected workflow type to be one of: yaml, ts');
 }
 
 function parseRelayflowVersion(value: string): RelayflowVersion {
@@ -485,16 +486,16 @@ function reconcileEnrollmentPin(
     if (result.status === 'conflict') {
       deps.warn(
         `This project's workspace pin (${result.pinPath}) is already linked to node ${result.pinnedNodeId}, ` +
-          `so it was left unchanged. 'relay node up' here will keep serving ${result.pinnedNodeId}, not the node ` +
-          `just enrolled (${result.nodeId}). Update or remove the pin to serve the new node.`
+          `so it was left unchanged rather than linked to the node just enrolled (${result.nodeId}). ` +
+          'Enrollment did not change the selected workspace or start a runtime.'
       );
     }
     return result;
   } catch (err) {
     deps.warn(
-      `Enrollment succeeded but this project's workspace pin could not be updated: ${
-        err instanceof Error ? err.message : String(err)
-      }. 'relay node up' in this project may ignore the new enrollment.`
+      `Enrollment succeeded but this project's workspace pin could not be updated: ${describeError(
+        err
+      )}. The project pin may still name a different node; no runtime was started.`
     );
     return undefined;
   }
@@ -824,8 +825,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
         });
 
         const payload = (await response.json().catch(() => null)) as
-          | (WhoAmIResponse & { error?: string })
-          | null;
+          (WhoAmIResponse & { error?: string }) | null;
 
         if (!response.ok || !payload?.authenticated) {
           throw new Error(payload?.error || 'Failed to resolve auth status');
@@ -895,9 +895,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
         deps.error(
           isCloudLoginError(err)
             ? 'Cloud login required. Run `agent-relay cloud login` and retry.'
-            : err instanceof Error
-              ? err.message
-              : String(err)
+            : describeError(err)
         );
         deps.exit(1);
       } finally {
@@ -951,7 +949,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
 
   cloudCommand
     .command('enroll')
-    .description('Enroll this machine as a Cloud-managed fleet node')
+    .description('Save a Cloud fleet enrollment for this machine (does not start a runtime)')
     .addOption(
       new Option('--token <token>', 'One-time Cloud enrollment token (ocl_node_enr_...)').conflicts(
         'workspace'
@@ -994,9 +992,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
             deps.upsertFleetNodeEnrollment(record);
           } catch (persistErr) {
             deps.error(
-              `Enrollment succeeded but persisting credentials failed: ${
-                persistErr instanceof Error ? persistErr.message : String(persistErr)
-              }`
+              `Enrollment succeeded but persisting credentials failed: ${describeError(persistErr)}`
             );
             // The one-time token is already consumed, so the credentials must
             // survive somewhere. Prefer a 0600 recovery file (never print the
@@ -1008,7 +1004,8 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
                 `The one-time enrollment token has been consumed. Credentials were saved to ${recoveryPath} (owner-only permissions).`
               );
               deps.error(
-                "Fix the store problem and re-add them from that file, or export RELAY_NODE_TOKEN/RELAY_NODE_ID/RELAY_BASE_URL from it before 'relay node up'. Delete the file afterwards."
+                'Fix the store problem and recover the enrollment from that private file, then delete it. ' +
+                  'For headless server setup, see https://agentrelay.com/docs/headless-server.'
               );
             } catch {
               deps.error(
@@ -1016,16 +1013,16 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
               );
               deps.error(JSON.stringify(record, null, 2));
               deps.error(
-                "Export RELAY_NODE_TOKEN/RELAY_NODE_ID/RELAY_BASE_URL from them before 'relay node up'."
+                'No runtime was started. For headless server setup, see https://agentrelay.com/docs/headless-server.'
               );
             }
             deps.exit(1);
             return;
           }
 
-          // A repo pinned to a workspace ignores the enrollment store entirely
-          // on `node up`, so link the two now while we know the node id. Never
-          // let this fail the command: the one-time token is already redeemed.
+          // Keep the enrolled node metadata on the existing project pin. This
+          // does not start a runtime or verify the workspace key. Never fail
+          // the command here: the one-time token is already redeemed.
           const pin = reconcileEnrollmentPin(record.nodeId, deps);
 
           if (options.json) {
@@ -1039,18 +1036,20 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
           const nodeIdSuffix = record.nodeId ? ` (${record.nodeId})` : '';
           deps.log(
             `Enrolled node "${record.nodeName}"${nodeIdSuffix} in workspace ${record.relayWorkspaceId}. ` +
-              "Run 'relay node up' to serve it."
+              'Enrollment saved; no runtime was started. To join an existing Desktop workspace ' +
+              'as a live spawn target, use the Linux account-aware service: ' +
+              'https://agentrelay.com/docs/headless-server.'
           );
           if (pin?.status === 'linked') {
             deps.log(
-              `Linked this project's workspace pin (${pin.pinPath}) to node ${pin.nodeId}, so ` +
-                `'relay node up' here serves this enrollment in workspace ${record.relayWorkspaceId}. ` +
+              `Linked this project's workspace pin (${pin.pinPath}) to node ${pin.nodeId} ` +
+                `as enrollment metadata for workspace ${record.relayWorkspaceId}. ` +
                 'The pinned workspace key was not verified against that workspace — if they differ, ' +
                 'agent commands in this project keep using the pinned one.'
             );
           }
         } catch (err) {
-          deps.error(err instanceof Error ? err.message : String(err));
+          deps.error(describeError(err));
           deps.exit(1);
         }
       }
@@ -1063,7 +1062,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
     .description('Submit a workflow run')
     .argument('<workflow>', 'Workflow file path or inline workflow content')
     .option('--api-url <url>', 'Cloud API base URL')
-    .option('--file-type <type>', 'Workflow type: yaml, ts, or py', parseWorkflowFileType)
+    .option('--file-type <type>', 'Workflow type: yaml or ts', parseWorkflowFileType)
     .option('--relayflow-version <version>', 'Relayflow engine generation: v1 or v2', parseRelayflowVersion)
     .option('--sync-code', 'Upload the current working directory before running')
     .option('--no-sync-code', 'Skip uploading the current working directory')
@@ -1129,7 +1128,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
     .description('Schedule a repeatable workflow run')
     .argument('<workflow>', 'Workflow file path or inline workflow content')
     .option('--api-url <url>', 'Cloud API base URL')
-    .option('--file-type <type>', 'Workflow type: yaml, ts, or py', parseWorkflowFileType)
+    .option('--file-type <type>', 'Workflow type: yaml or ts', parseWorkflowFileType)
     .option(
       '--relayflow-version <version>',
       'Relayflow engine generation for scheduled runs: v1 (v2 is not supported)',
@@ -1369,7 +1368,7 @@ export function registerCloudCommands(program: Command, overrides: Partial<Cloud
         });
         deps.log('Patch applied successfully.');
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = describeError(err);
         deps.error(`Failed to apply patch: ${message}`);
         deps.error(`Patch saved to: ${tmpPatch}`);
         deps.exit(1);

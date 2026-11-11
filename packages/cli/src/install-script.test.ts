@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { INSTALLER_LAUNCHER_MARKER } from './cli/lib/core-maintenance.js';
+
 const installScriptPath = fileURLToPath(new URL('../../../install.sh', import.meta.url));
 const installScript = fs.readFileSync(installScriptPath, 'utf-8');
 
@@ -89,36 +91,27 @@ describe('install.sh', () => {
     });
   });
 
-  describe('download_broker_binary', () => {
-    const body = fnBody('download_broker_binary');
-
-    it('fetches into a temp file, then installs atomically with the smoke-test check', () => {
-      const fetch = at(body, /fetch_release_asset /);
-      const install = at(body, /install_binary_atomic "\$FETCHED_TMP" "\$d1" check_broker_binary/);
-      expect(fetch).toBeGreaterThanOrEqual(0);
-      expect(install).toBeGreaterThan(fetch);
-    });
-
-    it('never writes or signs the live path directly', () => {
-      expect(body).not.toMatch(/-o\s*"\$target_path"/);
-      expect(body).not.toMatch(/>\s*"\$target_path"/);
-      expect(body).not.toMatch(/codesign[^\n]*"\$target_path"/);
-      expect(body).not.toMatch(/"\$target_path" --help/);
-    });
-
-    it('copies to BIN_DIR through the atomic path, not a bare cp', () => {
-      expect(body).toMatch(/local d1="\$target_path"/);
-      expect(body).toMatch(/local d2="\$BIN_DIR\/agent-relay-broker"/);
-      expect(body).toMatch(/copy_binary_atomic "\$d1" "\$d2"/);
-      expect(body).not.toMatch(/^\s*cp /m);
+  describe('retired broker', () => {
+    it('never downloads, runs or installs an agent-relay-broker', () => {
+      for (const fn of [
+        'download_broker_binary',
+        'check_broker_binary',
+        'smoke_test_broker',
+        'undo_brokers',
+      ]) {
+        expect(installScript).not.toMatch(new RegExp(`^${fn}\\(\\)`, 'm'));
+      }
+      // The only mentions left say an older release's broker is left alone.
+      const mentions = installScript.split('\n').filter((line) => /broker/i.test(line));
+      expect(mentions.length).toBeGreaterThan(0);
+      expect(mentions.every((line) => line.trimStart().startsWith('#'))).toBe(true);
     });
   });
 
   describe('install transaction', () => {
-    it('signal handler snapshots the transaction once and undoes both brokers and the CLI', () => {
+    it('signal handler snapshots the transaction once and undoes the CLI', () => {
       const body = fnBody('handle_signal');
       expect(body).toMatch(/local st="\$TXN_STATE"/);
-      expect(body).toMatch(/undo_brokers/);
       expect(body).toMatch(/undo_cli/);
       expect(body).toMatch(/cleanup_temp_files/);
     });
@@ -126,7 +119,7 @@ describe('install.sh', () => {
     it('commits with a single TXN_STATE assignment before any backup cleanup', () => {
       const body = fnBody('main');
       const commit = at(body, /# COMMIT[\s\S]*?TXN_STATE=""/);
-      const cleanup = at(body, /cleanup_broker_backups/);
+      const cleanup = at(body, /rm -f "\$INSTALL_DIR\/bin\/agent-relay\$\{TXN_SUFFIX\}"/);
       expect(commit).toBeGreaterThanOrEqual(0);
       expect(cleanup).toBeGreaterThan(commit);
     });
@@ -141,16 +134,6 @@ describe('install.sh', () => {
       expect(digest).toBeGreaterThan(download);
     });
 
-    it('check_broker_binary runs a real init smoke test, not only --help', () => {
-      const check = fnBody('check_broker_binary');
-      expect(check).toMatch(/smoke_test_broker "\$1"/);
-      const smoke = fnBody('smoke_test_broker_run');
-      expect(smoke).toMatch(/env -i/);
-      expect(smoke).toMatch(/"\$bin" init /);
-      expect(smoke).toMatch(/--api-port 0/);
-      expect(smoke).toMatch(/RELAY_BASE_URL=/);
-    });
-
     it('the standalone CLI and relay-acp also install through install_binary_atomic', () => {
       expect(fnBody('download_standalone_binary')).toMatch(
         /install_binary_atomic "\$FETCHED_TMP" "\$target_path" check_cli_binary/
@@ -158,6 +141,70 @@ describe('install.sh', () => {
       expect(fnBody('download_relay_acp')).toMatch(
         /install_binary_atomic "\$FETCHED_TMP" "\$target_path" check_help_binary/
       );
+    });
+  });
+
+  describe('single install location', () => {
+    it('installs under AGENT_RELAY_INSTALL_DIR, else AGENT_RELAY_HOME, else ~/.agentworkforce/relay', () => {
+      expect(installScript).toMatch(
+        /^INSTALL_DIR="\$\(normalize_install_root "\$\{AGENT_RELAY_INSTALL_DIR:-\}"\)"$/m
+      );
+      expect(installScript).toMatch(
+        /^\[ -n "\$INSTALL_DIR" \] \|\| INSTALL_DIR="\$\(normalize_install_root "\$\{AGENT_RELAY_HOME:-\}"\)"$/m
+      );
+      expect(installScript).toMatch(/^\[ -n "\$INSTALL_DIR" \] \|\| INSTALL_DIR="\$DEFAULT_INSTALL_DIR"$/m);
+      expect(installScript).toMatch(/^DEFAULT_INSTALL_DIR="\$HOME\/\.agentworkforce\/relay"$/m);
+    });
+
+    it('exports a relocated install root from both the binary and the source launcher', () => {
+      expect(fnBody('install_binary_launcher')).toMatch(/\$\(launcher_env_lines\)/);
+      expect(fnBody('install_node_launcher')).toMatch(/\$\(launcher_env_lines\)/);
+    });
+
+    it('marks both launchers and writes the short relay launcher with the same body', () => {
+      expect(fnBody('install_binary_launcher')).toMatch(/^\$LAUNCHER_MARKER$/m);
+      expect(fnBody('install_node_launcher')).toMatch(/^\$LAUNCHER_MARKER$/m);
+      expect(fnBody('write_launchers')).toMatch(/write_executable_file "\$BIN_DIR\/agent-relay"/);
+      expect(fnBody('write_launchers')).toMatch(/write_executable_file "\$BIN_DIR\/relay"/);
+    });
+
+    it('uses the launcher marker that `agent-relay uninstall` looks for', () => {
+      expect(installScript).toContain(`LAUNCHER_MARKER="${INSTALLER_LAUNCHER_MARKER}"`);
+    });
+
+    it('never deletes the install root when replacing a source checkout', () => {
+      const body = fnBody('install_from_source');
+      expect(body).toMatch(/local source_dir="\$INSTALL_DIR\/source"/);
+      expect(body).not.toMatch(/rm -rf "\$INSTALL_DIR"/);
+    });
+
+    it('bounds both optional relaycast-engine downloads', () => {
+      const curls = fnBody('install_relaycast_engine').match(/curl [^\n]*/g) ?? [];
+      expect(curls).toHaveLength(2);
+      for (const call of curls) {
+        expect(call).toMatch(/--connect-timeout \d+/);
+        expect(call).toMatch(/--max-time \d+/);
+      }
+    });
+
+    it('pins relaycast-engine in exactly one place', () => {
+      expect(installScript.match(/^RELAYCAST_ENGINE_VERSION=/gm)).toHaveLength(1);
+      expect(installScript).toMatch(/^RELAYCAST_ENGINE_VERSION="\d+\.\d+\.\d+"$/m);
+    });
+
+    it('downloads relaycast-engine into the canonical bin dir through the atomic path', () => {
+      const body = fnBody('install_relaycast_engine');
+      expect(body).toMatch(/relaycast-engine-\$\{RELAYCAST_ENGINE_VERSION\}-\$\{OS\}-\$\{ARCH\}/);
+      expect(body).toMatch(/local target="\$INSTALL_DIR\/bin\/relaycast-engine"/);
+      expect(body).toMatch(/\.sha256/);
+      expect(body).toMatch(/install_binary_atomic "\$dl" "\$target"/);
+      // Never fatal: every path returns 0.
+      expect(body).not.toMatch(/\berror\b|return 1/);
+    });
+
+    it('installs relaycast-engine on both the standalone and npm paths', () => {
+      expect(fnBody('main')).toMatch(/install_relaycast_engine/);
+      expect(fnBody('install_via_npm')).toMatch(/install_relaycast_engine/);
     });
   });
 });
