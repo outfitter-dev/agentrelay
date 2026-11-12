@@ -3,7 +3,6 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
 import { extract } from 'tar';
 
@@ -20,6 +19,21 @@ import {
 } from '@agent-relay/cloud';
 
 import { defaultExit } from '../lib/exit.js';
+import { prepareWorkerAuthoredRuntime } from '../lib/cloud-worker-authored-runtime.js';
+import {
+  readWorkerEnrollmentToken,
+  type WorkerEnrollmentTokenOptions,
+  type WorkerEnrollmentTokenStream,
+} from '../lib/cloud-worker-enrollment-token.js';
+import { buildRelayflowsRunArgs, resolveAgentRelayCliChildCommand } from '../lib/agent-relay-cli-reentry.js';
+import {
+  isCliCredentialsPayload,
+  cliLoginHome,
+  materializeCliCredentials,
+  removeLoginHome,
+  writeBackCliCredentials,
+  type MaterializedCliCredentials,
+} from '../lib/cloud-worker-cli-credentials.js';
 
 type ExitFn = (code: number) => never;
 
@@ -32,10 +46,9 @@ export interface CloudWorkerDependencies {
   now: () => Date;
   cwd: () => string;
   fetchImpl: typeof fetch;
-  resolveRelayflowsCliEntrypoint: () => string;
+  stdin?: WorkerEnrollmentTokenStream;
+  resolveAgentRelayCliEntrypoint: () => string;
 }
-
-const nodeRequire = createRequire(import.meta.url);
 
 function withDefaults(overrides: Partial<CloudWorkerDependencies> = {}): CloudWorkerDependencies {
   return {
@@ -47,7 +60,8 @@ function withDefaults(overrides: Partial<CloudWorkerDependencies> = {}): CloudWo
     now: () => new Date(),
     cwd: () => process.cwd(),
     fetchImpl: fetch,
-    resolveRelayflowsCliEntrypoint: () => nodeRequire.resolve('@relayflows/cli'),
+    stdin: process.stdin,
+    resolveAgentRelayCliEntrypoint: () => process.argv[1] ?? 'agent-relay',
     ...overrides,
   };
 }
@@ -80,11 +94,15 @@ function safePathSegment(value: string): string {
 
 function buildWorkerRuntimeEnv(
   payload: WorkerWorkflowPayload,
-  deps: CloudWorkerDependencies
+  deps: CloudWorkerDependencies,
+  cliCredentialEnv: Record<string, string> = {}
 ): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...deps.env,
     ...payload.envSecrets,
+    // Materialised subscription logins (CODEX_HOME/GROK_HOME pointing into the
+    // run dir) win over anything inherited or delivered under those names.
+    ...cliCredentialEnv,
     AGENT_RELAY_CLOUD_WORKER_RUN_ID: payload.runId,
     RELAY_WORKSPACE_ID: payload.relayWorkspaceId,
     RELAY_API_KEY: payload.relaycastApiKey,
@@ -93,21 +111,30 @@ function buildWorkerRuntimeEnv(
     RELAYFILE_URL: payload.relayfileUrl,
     RELAYFILE_TOKEN: payload.relayfileToken,
   };
+  if (payload.fileType === 'ts') {
+    const [major, minor] = process.versions.node.split('.').map(Number);
+    if (!process.versions.bun && (major! < 22 || (major === 22 && minor! < 12))) {
+      throw new Error('Authored worker assignments require Node.js 22.12 or newer, or Bun.');
+    }
+    // Node 22.14 needs this opt-in to import .flow.ts. Keep it scoped to
+    // this assignment and inherited by the standalone Bun CLI's SDK Node child.
+    env.NODE_OPTIONS = `${env.NODE_OPTIONS ?? ''} --experimental-strip-types`.trim();
+  }
+  return env;
 }
 
-function relayflowsArgs(
-  relayflowsCli: string,
-  workflowPath: string,
-  payload: WorkerWorkflowPayload
-): string[] {
-  return [
-    relayflowsCli,
-    'run',
-    workflowPath,
-    ...(payload.resumeRunId ? ['--resume', payload.resumeRunId] : []),
-    ...(payload.startFrom ? ['--start-from', payload.startFrom] : []),
-    ...(payload.previousRunId ? ['--previous-run-id', payload.previousRunId] : []),
-  ];
+function assertFreshWorkerAssignment(payload: WorkerWorkflowPayload): void {
+  const unsupportedSelectors = [
+    payload.resumeRunId ? 'resumeRunId' : undefined,
+    payload.startFrom ? 'startFrom' : undefined,
+    payload.previousRunId ? 'previousRunId' : undefined,
+  ].filter((name): name is string => name !== undefined);
+  if (unsupportedSelectors.length > 0) {
+    throw new Error(
+      `Cloud worker cannot execute state-bearing v2 assignment selectors: ${unsupportedSelectors.join(', ')}. ` +
+        'Submit a fresh assignment; resume requires hosted v2 run state.'
+    );
+  }
 }
 
 async function runChild(input: {
@@ -210,27 +237,57 @@ async function materializeCodeMounts(input: {
   }
 }
 
-export function createDefaultAssignmentRunner(deps: CloudWorkerDependencies): ExecuteWorkerAssignment {
+export function createDefaultAssignmentRunner(
+  deps: CloudWorkerDependencies,
+  options: { localAgent?: boolean } = {}
+): ExecuteWorkerAssignment {
   return async ({ payload, worker, signal }) => {
-    // Cloud owns assignment control-plane semantics. relayflows owns execution.
-    // This boundary materializes the Cloud payload into a local workflow
-    // directory/env and then invokes relayflows with the equivalent run flags.
+    // Cloud owns assignment control-plane semantics. Relayflows owns execution.
+    // This boundary materializes a fresh Cloud payload into a local workflow
+    // directory/env and re-enters Relay's v2 `flows run` surface. State-bearing
+    // assignments fail closed until the worker protocol carries hosted v2 state.
+    assertFreshWorkerAssignment(payload);
     const runDir = path.join(cloudWorkerStateDir(deps.env), 'runs', payload.runId);
     const keepRunDir = deps.env.AGENT_RELAY_WORKER_KEEP_RUN_DIR === '1';
+    const cliCredentials = isCliCredentialsPayload(payload.cliCredentials) ? payload.cliCredentials : null;
+    let materialized: MaterializedCliCredentials | null = null;
+    let writeBackDone = false;
     try {
       await fsp.mkdir(runDir, { recursive: true, mode: 0o700 });
       await fsp.chmod(runDir, 0o700).catch(() => undefined);
       await materializeCodeMounts({ worker, payload, runDir, deps, signal });
 
-      const workflowPath = path.join(runDir, safeFileName(payload.workflowFileName));
+      const suppliedName = safeFileName(payload.workflowFileName);
+      // The supported authored-flow SDK entrypoint recognizes *.flow.ts.
+      // Control can supply an ordinary *.ts name; preserve its directory/body.
+      const workflowName =
+        payload.fileType === 'ts' ? `${suppliedName.replace(/(?:\.flow)?\.ts$/i, '')}.flow.ts` : suppliedName;
+      const workflowPath = path.join(runDir, workflowName);
       await writeSecretFile(workflowPath, payload.workflow);
+      if (payload.fileType === 'ts') await prepareWorkerAuthoredRuntime(workflowPath);
 
-      const relayflowsCli = deps.resolveRelayflowsCliEntrypoint();
+      if (cliCredentials) {
+        materialized = await materializeCliCredentials({
+          worker,
+          credentials: cliCredentials,
+          runDir,
+          fetchImpl: deps.fetchImpl,
+          signal,
+          log: deps.log,
+        });
+      }
+
+      const agentRelayCli = resolveAgentRelayCliChildCommand({
+        execPath: process.execPath,
+        cliEntrypoint: deps.resolveAgentRelayCliEntrypoint(),
+        args: buildRelayflowsRunArgs(workflowPath, payload.fileType, options),
+        cwd: deps.cwd(),
+      });
       const result = await runChild({
-        command: process.execPath,
-        args: relayflowsArgs(relayflowsCli, workflowPath, payload),
+        command: agentRelayCli.command,
+        args: agentRelayCli.args,
         cwd: runDir,
-        env: buildWorkerRuntimeEnv(payload, deps),
+        env: buildWorkerRuntimeEnv(payload, deps, materialized?.env),
         deps,
         signal,
       });
@@ -239,22 +296,62 @@ export function createDefaultAssignmentRunner(deps: CloudWorkerDependencies): Ex
         throw new Error(`Workflow runner exited with code ${result.exitCode}`);
       }
 
+      const failedWriteBacks = await storeRefreshedLogins();
       return {
         exitCode: result.exitCode,
         durationMs: result.durationMs,
-        summary: `Workflow ${payload.runId} completed.`,
+        summary: failedWriteBacks.length
+          ? `Workflow ${payload.runId} completed. The refreshed ${failedWriteBacks.join(', ')} login could not be stored; sign in again if the next run fails.`
+          : `Workflow ${payload.runId} completed.`,
       };
+    } catch (error) {
+      // A failed or cancelled run still stores a refreshed login (Grok rotates
+      // its single-use refresh token), and says so when it could not.
+      const failedWriteBacks = await storeRefreshedLogins();
+      if (failedWriteBacks.length && error instanceof Error) {
+        const warning = `The refreshed ${failedWriteBacks.join(', ')} login could not be stored; sign in again if the next run fails.`;
+        // Assignment reports keep the first 500 characters: lead with the
+        // warning when the original error would push it out.
+        error.message =
+          error.message.length + warning.length + 1 > 500
+            ? `${warning} ${error.message}`
+            : `${error.message} ${warning}`;
+      }
+      throw error;
     } finally {
+      await storeRefreshedLogins();
+      // The login files are removed even when the run directory is kept for
+      // debugging, and even when materialisation failed partway.
+      if (cliCredentials) {
+        const loginHome = materialized?.home ?? cliLoginHome(runDir);
+        await removeLoginHome(loginHome).catch(() => {
+          deps.error("[cloud-worker] could not remove the run's CLI login directory; delete it manually");
+        });
+      }
       if (!keepRunDir) {
         await fsp.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
       }
+    }
+
+    /** Writes back refreshed logins once; returns the CLIs whose login could not be stored. */
+    async function storeRefreshedLogins(): Promise<string[]> {
+      if (!cliCredentials || !materialized?.files.length || writeBackDone) return [];
+      writeBackDone = true;
+      const outcome = await writeBackCliCredentials({
+        worker,
+        credentials: cliCredentials,
+        materialized,
+        fetchImpl: deps.fetchImpl,
+        log: deps.log,
+      }).catch(() => ({ written: 0, failed: materialized?.files ?? [] }));
+      return outcome.failed.map((file) => file.cli);
     }
   };
 }
 
 async function startDaemon(input: {
   worker: CloudWorkerRecord;
-  options: { baseUrl?: string; workerId?: string; name?: string; once?: boolean };
+  options: { baseUrl?: string; workerId?: string; name?: string; once?: boolean; localAgent?: boolean };
   deps: CloudWorkerDependencies;
 }): Promise<CloudWorkerRecord> {
   const stateDir = cloudWorkerStateDir(input.deps.env);
@@ -262,21 +359,26 @@ async function startDaemon(input: {
   const logPath = path.join(stateDir, `${input.worker.workerId}.log`);
   const logFd = fs.openSync(logPath, 'a');
   let child: ChildProcess;
-  const args = [
-    process.argv[1] ?? 'agent-relay',
-    'cloud',
-    'worker',
-    'start',
-    '--worker-id',
-    input.worker.workerId,
-    '--base-url',
-    input.worker.baseUrl,
-    '--foreground-child',
-    ...(input.options.once ? ['--once'] : []),
-  ];
+  const launch = resolveAgentRelayCliChildCommand({
+    execPath: process.execPath,
+    cliEntrypoint: input.deps.resolveAgentRelayCliEntrypoint(),
+    args: [
+      'cloud',
+      'worker',
+      'start',
+      '--worker-id',
+      input.worker.workerId,
+      '--base-url',
+      input.worker.baseUrl,
+      '--foreground-child',
+      ...(input.options.once ? ['--once'] : []),
+      ...(input.options.localAgent ? ['--local-agent'] : []),
+    ],
+    cwd: input.deps.cwd(),
+  });
 
   try {
-    child = input.deps.spawnProcess(process.execPath, args, {
+    child = input.deps.spawnProcess(launch.command, launch.args, {
       detached: true,
       stdio: ['ignore', logFd, logFd],
       env: input.deps.env,
@@ -339,32 +441,38 @@ export function registerCloudWorkerCommands(
   workerCommand
     .command('register')
     .description('Register this machine as an Agent Relay Cloud worker')
-    .requiredOption('--token <token>', 'Worker enrollment token')
+    .option('--token <token>', 'Worker enrollment token (choose exactly one token source)')
+    .option('--token-file <path>', 'Read the enrollment token from a regular file (maximum 16 KiB)')
+    .option('--token-stdin', 'Read the enrollment token from non-interactive stdin (maximum 16 KiB)')
     .requiredOption('--name <name>', 'Worker name')
     .option('--base-url <url>', 'Cloud API base URL')
     .option('--json', 'Print raw JSON response', false)
-    .action(async (options: { token: string; name: string; baseUrl?: string; json?: boolean }) => {
-      const record = await registerCloudWorker({
-        enrollmentToken: options.token,
-        name: options.name,
-        baseUrl: options.baseUrl,
-        env: deps.env,
-        hostInfo: {
-          hostname: os.hostname(),
-          platform: os.platform(),
-          arch: os.arch(),
-          node: process.version,
-        },
-      });
+    .action(
+      async (options: WorkerEnrollmentTokenOptions & { name: string; baseUrl?: string; json?: boolean }) => {
+        const enrollmentToken = await readWorkerEnrollmentToken(options, deps.stdin);
+        const record = await registerCloudWorker({
+          enrollmentToken,
+          name: options.name,
+          baseUrl: options.baseUrl,
+          env: deps.env,
+          fetchImpl: deps.fetchImpl,
+          hostInfo: {
+            hostname: os.hostname(),
+            platform: os.platform(),
+            arch: os.arch(),
+            node: process.version,
+          },
+        });
 
-      if (options.json) {
-        deps.log(JSON.stringify({ ...record, workerToken: undefined }, null, 2));
-        return;
+        if (options.json) {
+          deps.log(JSON.stringify({ ...record, workerToken: undefined }, null, 2));
+          return;
+        }
+
+        deps.log(`Registered worker ${record.name} (${record.workerId})`);
+        deps.log(`Start: agent-relay cloud worker start --worker-id ${record.workerId}`);
       }
-
-      deps.log(`Registered worker ${record.name} (${record.workerId})`);
-      deps.log(`Start: agent-relay cloud worker start --worker-id ${record.workerId}`);
-    });
+    );
 
   workerCommand
     .command('start')
@@ -374,6 +482,11 @@ export function registerCloudWorkerCommands(
     .option('--name <name>', 'Stored worker name to start')
     .option('--daemon', 'Run in the background and write local daemon logs', false)
     .option('--once', 'Process one assignment, then exit', false)
+    .option(
+      '--local-agent',
+      'Attach the supported local Relayflows agent worker; provider setup is separate',
+      false
+    )
     .addOption(new Option('--foreground-child', 'Internal flag used by --daemon').hideHelp().default(false))
     .action(
       async (options: {
@@ -382,6 +495,7 @@ export function registerCloudWorkerCommands(
         name?: string;
         daemon?: boolean;
         once?: boolean;
+        localAgent?: boolean;
         foregroundChild?: boolean;
       }) => {
         const worker = resolveCloudWorkerRecord({
@@ -408,7 +522,8 @@ export function registerCloudWorkerCommands(
             worker,
             once: options.once,
             signal: controller.signal,
-            executeAssignment: createDefaultAssignmentRunner(deps),
+            executeAssignment: createDefaultAssignmentRunner(deps, { localAgent: options.localAgent }),
+            fetchImpl: deps.fetchImpl,
             log: (message) => deps.log(message),
           });
         } finally {
