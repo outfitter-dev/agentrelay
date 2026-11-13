@@ -3,8 +3,16 @@ import path from 'node:path';
 
 import type { CoreDependencies, CoreFileSystem } from '../commands/core.js';
 import { track } from '../telemetry/index.js';
-import { readBrokerConnection } from './broker-lifecycle.js';
 import { describeError } from './describe-error.js';
+import {
+  type InstallMethod,
+  UpdateError,
+  detectInstallMethod,
+  isInstallableVersion,
+  manualUpdateCommand,
+  updateNpmInstall,
+  updateStandaloneInstall,
+} from './self-update.js';
 import { errorClassName } from './telemetry-helpers.js';
 
 const SNIPPET_MARKER_START_PREFIX = '<!-- prpm:snippet:start @agent-relay/agent-relay-snippet@';
@@ -155,6 +163,15 @@ function removeZedConfig(
   }
 }
 
+/**
+ * `agent-relay update [--check]`: install the newest `latest` release with the
+ * method the running CLI was installed with (see self-update.ts), verify that
+ * the binary that ran now reports the new version, and exit non-zero on any
+ * failure. Prerelease builds are not moved along their channel: `update`
+ * tracks npm's `latest` dist-tag.
+ * @param options - `check` only reports, without installing
+ * @param deps - Core dependencies
+ */
 export async function runUpdateCommand(options: { check?: boolean }, deps: CoreDependencies): Promise<void> {
   const currentVersion = deps.getVersion();
   deps.log(`Current version: ${currentVersion}`);
@@ -169,43 +186,102 @@ export async function runUpdateCommand(options: { check?: boolean }, deps: CoreD
 
   if (!info.updateAvailable) {
     deps.log('You are running the latest version.');
+    if (currentVersion.includes('-')) {
+      deps.log(
+        `Note: ${currentVersion} is a prerelease; \`agent-relay update\` only installs releases from the \`latest\` channel` +
+          `${info.latestVersion ? ` (currently ${info.latestVersion})` : ''}.`
+      );
+    }
     return;
   }
 
-  deps.log(`New version available: ${info.latestVersion ?? 'latest'}`);
+  const toVersion = info.latestVersion ?? 'latest';
+  deps.log(`New version available: ${toVersion}`);
 
   if (options.check) {
     deps.log('Run `agent-relay update` to install.');
     return;
   }
 
-  deps.log('Installing update...');
-  const toVersion = info.latestVersion ?? 'latest';
-  try {
-    const { stdout, stderr } = await deps.execCommand('npm install -g agent-relay@latest');
-    if (stdout.trim().length > 0) {
-      deps.log(stdout.trimEnd());
-    }
-    if (stderr.trim().length > 0) {
-      deps.error(stderr.trimEnd());
-    }
-    deps.log(`Successfully updated to ${toVersion}`);
-    track('cli_update', {
-      from_version: currentVersion,
-      to_version: toVersion,
-      success: true,
-    });
-  } catch (err: unknown) {
+  await installVersion(deps, detectInstallMethod(deps), currentVersion, toVersion);
+}
+
+async function installVersion(
+  deps: CoreDependencies,
+  method: InstallMethod,
+  currentVersion: string,
+  toVersion: string
+): Promise<void> {
+  const fail = (err: unknown, hint?: string): void => {
     const errorClass = errorClassName(err);
     track('cli_update', {
       from_version: currentVersion,
       to_version: toVersion,
       success: false,
+      install_method: method.kind,
       ...(errorClass ? { error_class: errorClass } : {}),
     });
     deps.error(`Failed to install update: ${toErrorMessage(err)}`);
-    deps.log('Try running manually: npm install -g agent-relay@latest');
+    if (hint) {
+      deps.log(`Try running manually: ${hint}`);
+    }
+  };
+
+  if (!isInstallableVersion(toVersion)) {
+    fail(new UpdateError(`the registry returned an unusable version (${toVersion})`));
     deps.exit(1);
+    return;
+  }
+  if (method.kind === 'unknown') {
+    fail(
+      new UpdateError(`cannot tell how agent-relay was installed: ${method.reason}`),
+      manualUpdateCommand(method, toVersion)
+    );
+    deps.exit(1);
+    return;
+  }
+
+  deps.log(`Installing ${toVersion} (${method.kind === 'standalone' ? 'standalone install' : 'npm'})...`);
+  let failed = false;
+  try {
+    if (method.kind === 'standalone') {
+      await updateStandaloneInstall(deps, method, toVersion);
+    } else {
+      await updateNpmInstall(deps, method, toVersion);
+    }
+  } catch (err: unknown) {
+    fail(err, manualUpdateCommand(method, toVersion));
+    failed = true;
+  }
+  if (failed) {
+    deps.exit(1);
+    return;
+  }
+
+  const location = method.kind === 'standalone' ? method.binaryPath : method.cliScript;
+  deps.log(`Successfully updated to ${toVersion} (${location})`);
+  track('cli_update', {
+    from_version: currentVersion,
+    to_version: toVersion,
+    success: true,
+    install_method: method.kind,
+  });
+}
+
+/** Marker line install.sh writes into every launcher it creates (see install.sh LAUNCHER_MARKER). */
+export const INSTALLER_LAUNCHER_MARKER = '# agent-relay launcher (written by the Agent Relay installer)';
+
+/**
+ * True when `filePath` itself is a regular file carrying the installer's marker.
+ * A symlink is never ours (install.sh writes regular files), even if it points at a marked launcher.
+ */
+function isInstallerLauncher(filePath: string, fs: CoreFileSystem): boolean {
+  try {
+    if (!fs.existsSync(filePath)) return false;
+    if (fs.lstatSync && !fs.lstatSync(filePath).isFile()) return false;
+    return fs.readFileSync(filePath, 'utf-8').includes(INSTALLER_LAUNCHER_MARKER);
+  } catch {
+    return false;
   }
 }
 
@@ -222,16 +298,6 @@ export async function runUninstallCommand(
 ): Promise<void> {
   const paths = deps.getProjectPaths();
   const connectionPath = path.join(paths.dataDir, 'connection.json');
-
-  // Kill the broker if running
-  const conn = readBrokerConnection(paths.dataDir);
-  if (conn && conn.pid > 0) {
-    try {
-      deps.killProcess(conn.pid, 'SIGTERM');
-    } catch {
-      // Ignore dead processes.
-    }
-  }
 
   const isDryRun = options.dryRun === true;
 
@@ -284,9 +350,13 @@ export async function runUninstallCommand(
   const standaloneBinDir = path.join(homeDir, '.local', 'bin');
   const installBinDirs = INSTALL_DIR_NAMES.map((installDir) => path.join(homeDir, installDir, 'bin'));
 
-  // Remove standalone binaries from ~/.local/bin
-  for (const binaryName of ['agent-relay', 'relay-acp']) {
+  // Remove standalone binaries from ~/.local/bin. The short `relay` launcher is
+  // removed only when install.sh wrote it: another tool may own that name.
+  for (const binaryName of ['agent-relay', 'relay', 'relay-acp']) {
     const binPath = path.join(standaloneBinDir, binaryName);
+    if (binaryName === 'relay' && !isInstallerLauncher(binPath, deps.fs)) {
+      continue;
+    }
     if (deps.fs.existsSync(binPath)) {
       if (isDryRun) {
         deps.log(`[dry-run] Would remove binary: ${binPath}`);

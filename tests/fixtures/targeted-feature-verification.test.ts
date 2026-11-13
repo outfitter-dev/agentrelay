@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
-import { validateMatrix } from '../../scripts/verify-features/cleanroom.mjs';
+import { enabledForProfile, validateMatrix } from '../../scripts/verify-features/cleanroom.mjs';
 import {
   buildTargetedPlan,
   changedFilesFromGit,
@@ -35,9 +35,19 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
+/** The plan of a manual dispatch, which reaches every lane. */
 function plan(changedFiles: string[]) {
+  return buildTargetedPlan({ changedFiles, matrix, manifestText, corpusCases, includeManual: true });
+}
+
+/** The plan of a pull request. */
+function prPlan(changedFiles: string[]) {
   return buildTargetedPlan({ changedFiles, matrix, manifestText, corpusCases });
 }
+
+const laneIds = (selected: { scenarios: Array<{ laneId: string }> }) =>
+  [...new Set(selected.scenarios.map(({ laneId }) => laneId))].sort();
+const setupIds = (selected: { setup: Array<{ id: string }> }) => selected.setup.map(({ id }) => id);
 
 function generatedCommandPayload(command: string): Record<string, any> {
   const match = command.match(/--payload '([A-Za-z0-9_-]+)'$/);
@@ -94,13 +104,9 @@ describe('targeted Flows v2 PR verification', () => {
     expect(result.selectedFeatures).toEqual(
       expect.arrayContaining(['fleet-nodes', 'fleet-nodes-pretty', 'fleet-spawn', 'fleet-release'])
     );
-    expect(result.scenarios.map(({ id }: { id: string }) => id)).toEqual([
-      'fleet-attach-contracts',
-      'fleet-daytona-board-contract',
-    ]);
+    expect(result.scenarios.map(({ id }: { id: string }) => id)).toEqual(['fleet-attach-contracts']);
     expect(result.setup.map(({ id }: { id: string }) => id)).toEqual(['build-core']);
     expect(result.scenarios.map(({ id }: { id: string }) => id)).not.toContain('two-node-fleet-e2e');
-    expect(result.coverageGaps.map(({ id }: { id: string }) => id)).toContain('fleet-daytona-live-board');
     expect(() => validateTargetedPlan(result)).not.toThrow();
   });
 
@@ -173,10 +179,76 @@ describe('targeted Flows v2 PR verification', () => {
 
     expect(result.mode).toBe('targeted');
     expect(result.selectedCategories).toEqual(['fleet']);
-    expect(result.scenarios.map(({ id }: { id: string }) => id)).toEqual([
-      'fleet-attach-contracts',
-      'fleet-daytona-board-contract',
-    ]);
+    expect(result.scenarios.map(({ id }: { id: string }) => id)).toEqual(['fleet-attach-contracts']);
+  });
+
+  it('runs only the core lane on a pull request, whatever the change', () => {
+    for (const file of [
+      'crates/relay-node/src/relay/delivery.rs',
+      'packages/cli/src/cli/commands/init.ts',
+      'crates/broker/src/main.rs',
+      'packages/cli/src/cli/commands/fleet.ts',
+      'packages/cli/src/cli/lib/new-runtime-surface.ts',
+      'scripts/verify-features/targeted-pr-plan.mjs',
+    ]) {
+      const selected = prPlan([file]);
+      expect(selected.mode, file).not.toBe('skip');
+      expect(laneIds(selected), file).toEqual(['core']);
+    }
+  });
+
+  it('routes core and init paths to the core lane without falling back', () => {
+    for (const file of [
+      'crates/relay-node/src/relay/delivery.rs',
+      'crates/relay-node/src/relay/grok.rs',
+      'crates/relay-node/src/relay/cursor_cli/wait.rs',
+      'crates/relay-node/Cargo.toml',
+      'packages/cli/src/cli/commands/init.ts',
+      'packages/cli/src/cli/lib/relay-node.ts',
+    ]) {
+      const selected = prPlan([file]);
+      expect(selected.mode, file).toBe('targeted');
+      expect(selected.unmatchedRuntimeFiles, file).toEqual([]);
+    }
+  });
+
+  it('builds the core from source only for a change to the core', () => {
+    expect(setupIds(prPlan(['crates/relay-node/src/relay/delivery.rs']))).toContain('build-core-from-source');
+    expect(setupIds(prPlan(['packages/cli/src/cli/commands/init.ts']))).not.toContain(
+      'build-core-from-source'
+    );
+    expect(setupIds(prPlan(['scripts/verify-features/targeted-pr-plan.mjs']))).not.toContain(
+      'build-core-from-source'
+    );
+  });
+
+  it('asks for Rust only when the core is built, in one shard', () => {
+    const shards = shardTargetedPlan(prPlan(['crates/relay-node/src/relay/delivery.rs']));
+    expect(shards).toHaveLength(1);
+    expect(
+      [...shards[0].setup, ...shards[0].scenarios].some(
+        ({ requiredCommands }: { requiredCommands?: string[] }) => requiredCommands?.includes('cargo')
+      )
+    ).toBe(true);
+    const withoutCore = prPlan(['packages/cli/src/cli/commands/init.ts']);
+    expect(
+      [...withoutCore.setup, ...withoutCore.scenarios].some(
+        ({ requiredCommands }: { requiredCommands?: string[] }) => requiredCommands?.includes('cargo')
+      )
+    ).toBe(false);
+  });
+
+  it('leaves the source build out of cleanroom runs, which use the pinned core', () => {
+    const core = matrix.lanes.find(({ id }: { id: string }) => id === 'core');
+    const enabled = core.setup.filter((step: object) => enabledForProfile(step, 'full'));
+    expect(enabled.map(({ id }: { id: string }) => id)).toEqual(['build-cli']);
+  });
+
+  it('keeps the old lanes and corpus for a manual dispatch', () => {
+    expect(prPlan(['scripts/verify-features/targeted-pr-plan.mjs']).scenarios).not.toContainEqual(
+      expect.objectContaining({ relayflowCorpusCase: expect.anything() })
+    );
+    expect(laneIds(plan(['scripts/verify-features/targeted-pr-plan.mjs']))).toContain('regression-corpus');
   });
 
   it('falls back to smoke when a selected category has only a live coverage gap', () => {
@@ -211,6 +283,7 @@ describe('targeted Flows v2 PR verification', () => {
         matrix,
         manifestText,
         corpusCases: [],
+        includeManual: true,
       })
     ).toThrow(/selected an empty RelayFlow corpus/);
   });
@@ -275,6 +348,7 @@ describe('targeted Flows v2 PR verification', () => {
         matrix: invalid,
         manifestText,
         corpusCases,
+        includeManual: true,
       })
     ).toThrow(/unknown fleet-injection-attach setup not-a-setup/);
   });
@@ -301,6 +375,7 @@ describe('targeted Flows v2 PR verification', () => {
         matrix: invalid,
         manifestText,
         corpusCases,
+        includeManual: true,
       })
     ).toThrow(/requires setup build-core that is unavailable in targeted/);
   });
@@ -316,6 +391,7 @@ describe('targeted Flows v2 PR verification', () => {
         matrix: invalid,
         manifestText,
         corpusCases,
+        includeManual: true,
       })
     ).toThrow(
       /RelayFlow corpus scenario regression-corpus\/relayflow-head-regression-corpus requires setup build-core/
@@ -333,6 +409,7 @@ describe('targeted Flows v2 PR verification', () => {
         matrix: invalid,
         manifestText,
         corpusCases,
+        includeManual: true,
       })
     ).toThrow(/expectedExitCodes must contain exit codes/);
   });
@@ -366,7 +443,6 @@ describe('targeted Flows v2 PR verification', () => {
       'validate-targeted-plan',
       'setup-fleet-injection-attach-build-core',
       'scenario-fleet-injection-attach-fleet-attach-contracts',
-      'scenario-fleet-injection-attach-fleet-daytona-board-contract',
       'targeted-verdict',
     ]);
     for (let index = 1; index < spec.steps.length; index += 1) {
@@ -508,35 +584,17 @@ describe('targeted Flows v2 PR verification', () => {
     expect(workflow).toContain('matrix: ${{ fromJSON(needs.select.outputs.matrix) }}');
   });
 
-  it('expands the broker binary template in a full-smoke spec', async () => {
-    const directory = await mkdtemp(path.join(os.tmpdir(), 'relay-targeted-pr-broker-'));
-    temporaryDirectories.push(directory);
-    const planPath = path.join(directory, 'plan.json');
-    const specPath = path.join(directory, 'spec.json');
-    const selected = plan(['scripts/verify-features/targeted-pr-plan.mjs']);
-    await writeFile(planPath, `${JSON.stringify(selected)}\n`);
+  it('keys the shard selection artifact by run so "Re-run failed jobs" can download it', async () => {
+    const workflow = parse(await readFile('.github/workflows/targeted-feature-verification.yml', 'utf8'));
+    const step = (job: string, name: string) =>
+      workflow.jobs[job].steps.find((candidate: { name?: string }) => candidate.name === name);
+    const upload = step('select', 'Upload immutable selection');
+    const download = step('targeted', 'Download immutable selection');
 
-    await execFileAsync(
-      process.execPath,
-      [
-        '--experimental-strip-types',
-        'flows/verify/targeted-pr.spec.ts',
-        '--plan',
-        planPath,
-        '--out',
-        specPath,
-      ],
-      { cwd: process.cwd(), timeout: 30_000 }
-    );
-    const spec = JSON.parse(await readFile(specPath, 'utf8'));
-    const brokerScenario = spec.steps.find(
-      ({ id }: { id: string }) => id === 'scenario-broker-agents-broker-process-integration'
-    );
-    const payload = generatedCommandPayload(brokerScenario.command);
-    expect(payload.environment.AGENT_RELAY_BIN).toBe(
-      path.join(process.cwd(), 'target', 'release', 'agent-relay-broker')
-    );
-    expect(JSON.stringify(payload)).not.toContain('{{brokerBinary}}');
-    expect(payload.forbidOutput).toEqual(['# SKIP']);
+    // No run_attempt: the select job is not re-run by "Re-run failed jobs".
+    expect(upload.with.name).toBe('targeted-feature-selection-${{ github.run_id }}');
+    expect(download.with.name).toBe(upload.with.name);
+    // "Re-run all jobs" re-uploads the same name.
+    expect(upload.with.overwrite).toBe(true);
   });
 });
