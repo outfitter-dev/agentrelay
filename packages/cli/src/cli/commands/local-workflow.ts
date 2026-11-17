@@ -3,17 +3,21 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { Command, InvalidArgumentError } from 'commander';
 
 import { defaultExit } from '../lib/exit.js';
+import {
+  buildRelayflowsRunArgs,
+  resolveAgentRelayCliChildCommand,
+  resolveAgentRelayScriptInterpreter,
+} from '../lib/agent-relay-cli-reentry.js';
 import { errorClassName } from '../lib/telemetry-helpers.js';
 import { track } from '../telemetry/index.js';
 import { applyV1LocalWorkflowDeprecations } from './cloud-v1-deprecations.js';
 
 type ExitFn = (code: number) => never;
 
-type LocalWorkflowFileType = 'ts' | 'js' | 'py' | 'sh' | 'yaml';
+type LocalWorkflowFileType = 'ts' | 'js' | 'sh' | 'yaml';
 type LocalWorkflowRunStatus = 'starting' | 'running' | 'completed' | 'failed';
 
 type LocalWorkflowRunRecord = {
@@ -47,7 +51,7 @@ export interface LocalWorkflowDependencies {
   cwd: () => string;
   env: NodeJS.ProcessEnv;
   spawnProcess: typeof spawnProcess;
-  resolveRelayflowsCliEntrypoint: () => string;
+  resolveAgentRelayCliEntrypoint: () => string;
   randomRunId: () => string;
   now: () => Date;
   sleep: (ms: number) => Promise<void>;
@@ -60,14 +64,12 @@ export interface LocalWorkflowDependencies {
 
 const RUN_ID_RE = /^local_[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/;
 const TERMINAL_STATUSES = new Set<LocalWorkflowRunStatus>(['completed', 'failed']);
-const nodeRequire = createRequire(import.meta.url);
-
 function withDefaults(overrides: Partial<LocalWorkflowDependencies> = {}): LocalWorkflowDependencies {
   return {
     cwd: () => process.cwd(),
     env: process.env,
     spawnProcess,
-    resolveRelayflowsCliEntrypoint: () => nodeRequire.resolve('@relayflows/cli'),
+    resolveAgentRelayCliEntrypoint: () => process.argv[1] ?? 'agent-relay',
     randomRunId: () =>
       `local_${new Date().toISOString().replace(/[-:.TZ]/g, '')}_${randomBytes(4).toString('hex')}`,
     now: () => new Date(),
@@ -106,10 +108,10 @@ function parseNonNegativeInteger(value: string): number {
 }
 
 function parseLocalWorkflowFileType(value: string): LocalWorkflowFileType {
-  if (value === 'ts' || value === 'js' || value === 'py' || value === 'sh' || value === 'yaml') {
+  if (value === 'ts' || value === 'js' || value === 'sh' || value === 'yaml') {
     return value;
   }
-  throw new InvalidArgumentError('Expected workflow type to be one of: ts, js, py, sh, yaml');
+  throw new InvalidArgumentError('Expected workflow type to be one of: ts, js, sh, yaml');
 }
 
 function inferLocalWorkflowFileType(filePath: string): LocalWorkflowFileType | null {
@@ -124,8 +126,6 @@ function inferLocalWorkflowFileType(filePath: string): LocalWorkflowFileType | n
     case '.mjs':
     case '.cjs':
       return 'js';
-    case '.py':
-      return 'py';
     case '.sh':
       return 'sh';
     case '.yaml':
@@ -136,10 +136,8 @@ function inferLocalWorkflowFileType(filePath: string): LocalWorkflowFileType | n
   }
 }
 
-function toTelemetryWorkflowFileType(
-  fileType: LocalWorkflowFileType | null
-): 'yaml' | 'ts' | 'py' | 'unknown' {
-  if (fileType === 'yaml' || fileType === 'ts' || fileType === 'py') {
+function toTelemetryWorkflowFileType(fileType: LocalWorkflowFileType | null): 'yaml' | 'ts' | 'unknown' {
+  if (fileType === 'yaml' || fileType === 'ts') {
     return fileType;
   }
   return 'unknown';
@@ -280,12 +278,23 @@ async function resolveLocalWorkflowCommand(
   fileType: LocalWorkflowFileType,
   deps: LocalWorkflowDependencies
 ): Promise<{ command: string; args: string[] }> {
-  if (fileType === 'yaml' || fileType === 'ts' || fileType === 'py') {
-    return { command: process.execPath, args: [deps.resolveRelayflowsCliEntrypoint(), 'run', workflowPath] };
+  if (fileType === 'yaml' || fileType === 'ts') {
+    return resolveAgentRelayCliChildCommand({
+      execPath: process.execPath,
+      cliEntrypoint: deps.resolveAgentRelayCliEntrypoint(),
+      args: buildRelayflowsRunArgs(workflowPath, fileType),
+      cwd: deps.cwd(),
+    });
   }
 
   if (fileType === 'js') {
-    return { command: process.execPath, args: [workflowPath] };
+    return {
+      command: resolveAgentRelayScriptInterpreter({
+        execPath: process.execPath,
+        cliEntrypoint: deps.resolveAgentRelayCliEntrypoint(),
+      }),
+      args: [workflowPath],
+    };
   }
 
   return { command: deps.env.SHELL?.trim() || '/bin/sh', args: [workflowPath] };
@@ -362,7 +371,11 @@ async function runLocalWorkflow(
   const logFd = fs.openSync(logPath, 'a');
   let monitor: ChildProcess;
   try {
-    monitor = deps.spawnProcess(process.execPath, [runnerPath], {
+    const scriptInterpreter = resolveAgentRelayScriptInterpreter({
+      execPath: process.execPath,
+      cliEntrypoint: deps.resolveAgentRelayCliEntrypoint(),
+    });
+    monitor = deps.spawnProcess(scriptInterpreter, [runnerPath], {
       cwd,
       detached: true,
       stdio: ['ignore', logFd, logFd],
@@ -477,8 +490,8 @@ export function registerLocalWorkflowCommands(
   program
     .command('run')
     .description('Run a workflow file locally')
-    .argument('<workflow>', 'Workflow file path (.yaml, .yml, .ts, .tsx, .py, .js, or .sh)')
-    .option('--file-type <type>', 'Workflow type: ts, js, py, sh, or yaml', parseLocalWorkflowFileType)
+    .argument('<workflow>', 'Workflow file path (.yaml, .yml, .ts, .tsx, .js, or .sh)')
+    .option('--file-type <type>', 'Workflow type: ts, js, sh, or yaml', parseLocalWorkflowFileType)
     .option('--json', 'Print raw JSON response', false)
     .action(async (workflow: string, options: { fileType?: LocalWorkflowFileType; json?: boolean }) => {
       const started = Date.now();
