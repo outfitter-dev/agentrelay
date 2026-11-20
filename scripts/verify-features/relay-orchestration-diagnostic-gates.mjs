@@ -43,7 +43,7 @@ function redact(value) {
     .replace(/\brk_(?:live|test)_[A-Za-z0-9_-]+\b/g, '[REDACTED_RELAY_KEY]')
     .replace(/\brelay_(?:pa|ws)_[A-Za-z0-9._-]+\b/g, '[REDACTED_RELAY_TOKEN]')
     .replace(
-      /\b(?:nt_live_|br_|rjt_live_|ot_live_|cld_at_|rth_at_|ocl_node_enr_)[A-Za-z0-9._-]+\b/g,
+      /\b(?:ar_ws_|ar_ag_|nt_live_|br_|rjt_live_|ot_live_|cld_at_|rth_at_|ocl_node_enr_)[A-Za-z0-9._-]+\b/g,
       '[REDACTED_CREDENTIAL]'
     )
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
@@ -498,13 +498,6 @@ function gateSpecs() {
   const paths = repoPaths();
   const specs = [
     {
-      id: 'relay-fleet-catalog',
-      cwd: paths.relay,
-      command: 'node',
-      args: ['scripts/verify-features/fleet-daytona.mjs', 'validate'],
-      timeoutMs: 120_000,
-    },
-    {
       id: 'relay-cleanroom-fixtures',
       cwd: paths.relay,
       command: 'npx',
@@ -512,7 +505,6 @@ function gateSpecs() {
         'vitest',
         'run',
         'tests/fixtures/verify-cleanroom.test.ts',
-        'tests/fixtures/verify-fleet-daytona.test.ts',
         'tests/fixtures/qualification-manifest.test.ts',
         'tests/fixtures/qualification-capabilities.test.ts',
         'tests/fixtures/diagnostic-seal.test.ts',

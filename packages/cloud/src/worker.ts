@@ -6,7 +6,7 @@ import path from 'node:path';
 import { buildApiUrl } from './api-client.js';
 import { defaultApiUrl } from './types.js';
 
-export type WorkerFileType = 'yaml' | 'ts' | 'py';
+export type WorkerFileType = 'yaml' | 'ts';
 
 export type WorkerWorkflowPayload = {
   runId: string;
@@ -15,12 +15,28 @@ export type WorkerWorkflowPayload = {
   relaycastApiKey: string;
   relaycastBaseUrl?: string;
   relayfileUrl: string;
-  relayfileToken: string;
+  /**
+   * Per-run Relayfile credential. Absent when the control plane minted none
+   * (self-hosted Control without Relayfile omits it and records
+   * run.relayfile_credential_unavailable); the run proceeds without mounts.
+   */
+  relayfileToken?: string;
   workflow: string;
   fileType: WorkerFileType;
   sourceFileType: WorkerFileType | 'workflow';
   workflowFileName: string;
   envSecrets?: Record<string, string>;
+  /**
+   * Subscription logins for the run: a short-lived reference the worker
+   * exchanges, with its worker token, for CLI auth files (see
+   * packages/cli/src/cli/commands/cloud-worker-cli-credentials.ts).
+   */
+  cliCredentials?: {
+    ref: string;
+    expiresAt?: string;
+    path: string;
+    credentials?: Array<{ credentialId: string; provider: string; cli: string }>;
+  };
   metadata?: Record<string, string>;
   s3CodeKey?: string;
   paths?: Array<{
@@ -523,12 +539,11 @@ function isWorkerWorkflowPayload(value: unknown): value is WorkerWorkflowPayload
     typeof value.relayWorkspaceId === 'string' &&
     typeof value.relaycastApiKey === 'string' &&
     typeof value.relayfileUrl === 'string' &&
-    typeof value.relayfileToken === 'string' &&
+    (value.relayfileToken === undefined || typeof value.relayfileToken === 'string') &&
     typeof value.workflow === 'string' &&
-    (value.fileType === 'yaml' || value.fileType === 'ts' || value.fileType === 'py') &&
+    (value.fileType === 'yaml' || value.fileType === 'ts') &&
     (value.sourceFileType === 'yaml' ||
       value.sourceFileType === 'ts' ||
-      value.sourceFileType === 'py' ||
       value.sourceFileType === 'workflow') &&
     typeof value.workflowFileName === 'string'
   );
