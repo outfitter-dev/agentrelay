@@ -13,6 +13,7 @@ import type {
   RelayAgentReleaseResult,
   RelaySendChannelMessageInput,
   RelayWorkspaceInfo,
+  RelayOwnerApprovalInput,
 } from './messaging/index.js';
 import {
   actionSchemaToJsonSchema,
@@ -113,6 +114,11 @@ export interface RelaySendMessageInput {
   blocks?: RelayMessageBlock[];
   idempotencyKey?: string;
   metadata?: Record<string, unknown> | null;
+  /**
+   * Sent as a delegate quoting the owner's approval for these actions
+   * (channel or direct message; not a group DM).
+   */
+  ownerApproval?: RelayOwnerApprovalInput;
 }
 
 export interface RelayReplyInput {
@@ -140,6 +146,8 @@ export interface RelayDirectInput {
   mode?: RelayMessageMode;
   idempotencyKey?: string;
   metadata?: Record<string, unknown> | null;
+  /** Sent as a delegate quoting the owner's approval for these actions. */
+  ownerApproval?: RelayOwnerApprovalInput;
 }
 
 /** Messaging surface plus the high-level overloads documented in the README. */
@@ -183,18 +191,25 @@ export interface WorkspaceFacadeDeps {
 
 export interface RelayRegisterOptions {
   /**
-   * Throw a `name_conflict` error when an agent with the same name already
-   * exists, instead of adopting the existing identity with a rotated token.
+   * Call the backend's plain `register` instead of its `registerOrRotate`
+   * compatibility path. Relaycast registration is create-only either way: an
+   * existing name is rejected with `name_conflict` and its token is unchanged.
    */
   strict?: boolean;
 }
 
 export interface RelayWorkspace {
   /**
-   * Register one or more agents. Idempotent by default: when an agent with
-   * the same name already exists, the existing identity is adopted and its
-   * token rotated. Pass `{ strict: true }` to fail on name conflicts instead.
-   * Token rotation invalidates any previously-issued token for that agent.
+   * Register one or more new agents. Registration is create-only: if an
+   * agent with the same name already exists, this rejects with
+   * `name_conflict` (HTTP 409), with or without `{ strict: true }`, and the
+   * existing identity and its token are left unchanged.
+   *
+   * To resume an existing agent, persist the token it was issued and call
+   * `reconnect({ apiToken })`. To get a new token for an existing name (for
+   * example after losing it), run `relay agent rotate <name>` (or
+   * `relay agent register <name>` again), which uses the Relaycast owner
+   * takeover and retires the previous token.
    */
   register<T extends AgentLike | AgentLike[]>(
     agents: T,
@@ -255,6 +270,9 @@ export function createEnrichedMessages(
     const messages = resolveFrom(sendInput.from);
     const text = buildText(sendInput.text ?? sendInput.msg, sendInput.mentions);
     if (Array.isArray(sendInput.to)) {
+      if (sendInput.ownerApproval) {
+        throw new Error('ownerApproval goes on a channel or direct message, not a group DM.');
+      }
       return messages.groupDirect({
         participants: sendInput.to.map(resolveAgentName),
         text,
@@ -273,6 +291,7 @@ export function createEnrichedMessages(
         mode: sendInput.mode,
         idempotencyKey: sendInput.idempotencyKey,
         metadata: sendInput.metadata,
+        ownerApproval: sendInput.ownerApproval,
       });
     }
     return messages.direct({
@@ -282,6 +301,7 @@ export function createEnrichedMessages(
       mode: sendInput.mode,
       idempotencyKey: sendInput.idempotencyKey,
       metadata: sendInput.metadata,
+      ownerApproval: sendInput.ownerApproval,
     });
   };
 
@@ -314,6 +334,7 @@ export function createEnrichedMessages(
       mode: input.mode,
       idempotencyKey: input.idempotencyKey,
       metadata: input.metadata,
+      ownerApproval: input.ownerApproval,
     });
   };
 
@@ -350,8 +371,10 @@ export function createWorkspaceFacade(messaging: RelayMessaging, deps?: Workspac
       seen.add(name);
     }
 
-    // Idempotent by default: adopt an existing agent (rotating its token)
-    // when the backend supports it. `strict` restores fail-on-conflict.
+    // Default calls go through `registerOrRotate` when the backend exposes it;
+    // `strict` uses plain `register`. Current Relaycast SDKs implement
+    // `registerOrRotate` as a create-only alias, so an existing name is
+    // rejected with `name_conflict` in both modes.
     const registerOne =
       !options?.strict && messaging.agents.registerOrRotate
         ? messaging.agents.registerOrRotate.bind(messaging.agents)
